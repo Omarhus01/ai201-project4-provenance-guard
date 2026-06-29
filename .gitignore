@@ -1,5 +1,8 @@
 .env
 .venv/
- __pycache__/
-  *.pyc
-assignment.md 
+__pycache__/
+*.pyc
+assignment.md
+provenance.db
+flask_out.txt
+flask_err.txt
