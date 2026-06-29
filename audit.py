@@ -26,6 +26,14 @@ def init_db() -> None:
             )
         """)
         conn.commit()
+        # MS5: add appeal columns to existing table; each wrapped in try/except
+        # because SQLite raises OperationalError if the column already exists.
+        for col_def in ("appeal_reasoning TEXT", "appeal_timestamp TEXT"):
+            try:
+                conn.execute(f"ALTER TABLE submissions ADD COLUMN {col_def}")
+            except sqlite3.OperationalError:
+                pass
+        conn.commit()
 
 
 def write_submission(
@@ -58,6 +66,30 @@ def write_submission(
                 label,
                 notes,
             ),
+        )
+        conn.commit()
+
+
+def get_submission(content_id: str) -> dict | None:
+    with _connect() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM submissions WHERE content_id = ?", (content_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def file_appeal(content_id: str, creator_reasoning: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE submissions
+            SET status = 'under_review',
+                appeal_reasoning = ?,
+                appeal_timestamp = ?
+            WHERE content_id = ?
+            """,
+            (creator_reasoning, datetime.now(UTC).isoformat(), content_id),
         )
         conn.commit()
 

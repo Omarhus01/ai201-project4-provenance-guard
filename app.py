@@ -8,8 +8,8 @@ from flask import Flask, jsonify, request
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
-from audit import get_log, init_db, write_submission
-from signals import classify, combine_scores, get_llm_score, get_stylometric_score
+from audit import file_appeal, get_log, get_submission, init_db, write_submission
+from signals import classify, combine_scores, generate_label, get_llm_score, get_stylometric_score
 
 app = Flask(__name__)
 
@@ -60,7 +60,7 @@ def submit():
         raw_score = combine_scores(signal_1_score, signal_2_score)
         attribution, confidence = classify(raw_score)
 
-    label = f"[MS3 placeholder] Attribution: {attribution}"
+    label = generate_label(attribution, confidence)
 
     write_submission(
         content_id=content_id,
@@ -81,6 +81,42 @@ def submit():
             "label": label,
         }
     )
+
+
+@app.route("/appeal", methods=["POST"])
+def appeal():
+    # No rate limit on /appeal:
+    # - Unknown content_ids hit the 404 guard immediately (no work done, no value to flood)
+    # - Repeat appeals on valid content_ids are rejected by the already-under-review guard
+    # Together these make flooding /appeal either pointless or self-limiting.
+    data = request.get_json(silent=True)
+    if not data or not data.get("content_id") or not data.get("creator_reasoning"):
+        return jsonify({"error": "content_id and creator_reasoning are required"}), 400
+
+    content_id = data["content_id"].strip()
+    creator_reasoning = data["creator_reasoning"].strip()
+
+    if not creator_reasoning:
+        return jsonify({"error": "creator_reasoning cannot be empty"}), 400
+
+    submission = get_submission(content_id)
+    if submission is None:
+        return jsonify({"error": f"No submission found with content_id '{content_id}'"}), 404
+
+    if submission["status"] == "under_review":
+        return jsonify({
+            "content_id": content_id,
+            "status": "under_review",
+            "message": "This content already has an appeal under review.",
+        }), 409
+
+    file_appeal(content_id, creator_reasoning)
+
+    return jsonify({
+        "content_id": content_id,
+        "status": "under_review",
+        "message": "Your appeal has been received and is under review.",
+    })
 
 
 @app.route("/log", methods=["GET"])
