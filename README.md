@@ -14,26 +14,33 @@ pip install -r requirements.txt
 python app.py
 ```
 
-Endpoints: `POST /submit`, `POST /appeal`, `GET /log`
+Endpoints: `POST /submit`, `POST /appeal`, `GET /log`, `GET /analytics`, `POST /verify`, `GET /certificate/<cert_id>`, `POST /submit/image`
+
+**Gradio UI** (all features in browser):
+```bash
+python ui.py   # launches on http://localhost:7860
+```
 
 ---
 
 ## Architecture
 
-A submitted piece of text enters at `POST /submit`, passes input validation and rate limiting, then flows through both detection signals. Signal 2 (stylometrics) runs first because it is pure Python and always succeeds; Signal 1 (Groq LLM) runs second because it can fail with a network error. Both scores feed the confidence scorer, the label generator selects the correct label text, and the full result is written to the SQLite audit log before the JSON response is returned.
+A submitted piece of text enters at `POST /submit`, passes through `pipeline.py` → `process_text_submission()`, which runs all three detection signals, combines them, classifies the result, and writes to the SQLite audit log. Both Flask (`app.py`) and the Gradio UI (`ui.py`) call this shared function — no duplicated pipeline logic.
 
-Appeals enter at `POST /appeal`, look up the original decision by `content_id`, check that the submission is not already under review (to protect the audit trail), then flip `status` to `under_review` and write the creator's reasoning into the same audit row.
+Appeals enter at `POST /appeal`, check the audit trail, and flip `status` to `under_review`. Creators can then request a Verified Human certificate at `POST /verify`.
 
 ```
 POST /submit
   → Input validation (400 on missing fields)
   → Rate limiter (429 when exceeded)
-  → Signal 2: stylometric heuristics  [pure Python, never fails]
-  → Signal 1: Groq LLM                [can 502 on network error]
-  → combine_scores(0.60×s1 + 0.40×s2) → raw_score
-  → classify(raw_score) → attribution + confidence
-  → generate_label(attribution, confidence) → label text
-  → audit log write (SQLite)
+  → pipeline.process_text_submission(text, creator_id)
+       → Signal 2: stylometric heuristics  [pure Python, always succeeds]
+       → Signal 3: AI phrase density       [pure Python, always succeeds]
+       → Signal 1: Groq LLM               [can 502 on network error]
+       → combine_scores(0.50×s1 + 0.30×s2 + 0.20×s3) → raw_score
+       → classify(raw_score) → attribution + confidence
+       → generate_label() → label text
+       → audit log write (SQLite, timeout=5)
   → JSON response: content_id, attribution, confidence, label
 
 POST /appeal
@@ -45,6 +52,28 @@ POST /appeal
 
 GET /log
   → get_log(limit) → all submission rows, newest first
+
+GET /analytics
+  → get_analytics() → totals, distribution, appeal_rate, signal_agreement_rate
+
+POST /verify
+  → get_submission(content_id) → 404 if not found
+  → 403 if likely_ai with no appeal (must appeal first)
+  → idempotent: returns existing cert if already issued
+  → issue_certificate() → cert_id
+  → JSON response: cert_id, content_id, issued_at
+
+GET /certificate/<cert_id>
+  → get_certificate(cert_id) → 404 if not found
+  → JSON: cert_id, content_id, creator_id, issued_at, statement, attribution, confidence
+
+POST /submit/image
+  → Input validation (400 on missing fields)
+  → Rate limiter (same as /submit)
+  → Signal 1 only: get_image_llm_score(image_b64, media_type)
+  → classify(signal_1_score) → attribution + confidence
+  → audit log write (content_type="image", s2/s3=null)
+  → JSON response: content_id, attribution, confidence, label, note
 ```
 
 ---
@@ -89,12 +118,28 @@ GET /log
 
 ---
 
+### Signal 3 — AI Phrase Density (pure Python)
+
+**What it measures:** Lexical patterns — how often the text uses phrases disproportionately common in LLM output (e.g. "it is important to note", "furthermore", "paradigm shift", "delve into", "stakeholders"). Frequency is computed per 1000 words and normalized against a `MAX_DENSITY` of 5.0 phrases per 1000 words.
+
+**Why it differs:** AI models are trained on each other's output and on human feedback that rewards certain formal, hedge-heavy phrasings. These phrases cluster in AI writing at rates rarely seen in unassisted human text. A single occurrence is unremarkable; three or four in a 200-word passage is a strong signal.
+
+**Why I chose it:** Lexically independent from both Signal 1 (which judges voice and coherence holistically) and Signal 2 (which measures sentence structure statistics). Signal 1's system prompt was explicitly cleaned of phrase enumeration so that Signal 1 and Signal 3 do not overlap — Signal 1 judges the *feel* of the writing, Signal 3 counts the *words*.
+
+**Reliability note:** This is the **weakest of the three signals**. It is trivially gameable — an AI output with the same phrases swapped out would score 0.0. The phrase list is static; new AI writing patterns go undetected until the list is updated. It serves as a complementary tiebreaker at the margin, not a primary classifier. Signal 1 remains dominant at 50% weight.
+
+**Short-text guard:** If fewer than 10 words, returns 0.5 (neutral) — consistent with the Signal 1 and Signal 2 guards.
+
+**Output:** `signal_3_score` — float 0.0–1.0 (1.0 = phrase density ≥ 5 per 1000 words), always succeeds. `null` in the audit log for image submissions and pre-ensemble rows.
+
+---
+
 ## Confidence Scoring
 
 ### Combination formula
 
 ```
-raw_score = (0.60 × signal_1_score) + (0.40 × signal_2_score)
+raw_score = (0.50 × signal_1_score) + (0.30 × signal_2_score) + (0.20 × signal_3_score)
 confidence = 0.5 + |raw_score − 0.5|
 
 if raw_score >= 0.70  → attribution = "likely_ai"
@@ -102,9 +147,21 @@ elif raw_score <= 0.30 → attribution = "likely_human"
 else                   → attribution = "uncertain"
 ```
 
-Signal 1 is weighted 0.60 because it captures semantic meaning — the thing Signal 2 is entirely blind to. Signal 2 is weighted 0.40 because it is structurally independent and cheap to compute. The confidence formula maps any `raw_score` to a [0.5, 1.0] certainty value: 0.5 means the system genuinely cannot tell; 1.0 means both signals strongly agree. The same high confidence value can represent a strong AI verdict or a strong human verdict — it measures agreement, not direction.
+Signal 1 is weighted 0.50 — it captures semantic meaning, the thing both other signals are blind to. Signal 2 is weighted 0.30 — structurally independent, three distinct sub-metrics. Signal 3 is weighted 0.20 — a useful lexical tiebreaker but gameable and static, so it carries the least weight. The confidence formula maps any `raw_score` to a [0.5, 1.0] certainty value — it measures how strongly the signals agree, not which direction they point.
 
-The uncertain band (0.30–0.70) is intentionally wide. A false positive — labeling a human's work as AI — is worse than a false negative on a writing platform. Forcing borderline cases into accusations is the wrong failure mode.
+The uncertain band (0.30–0.70) is intentionally wide. A false positive — labeling a human's work as AI — is worse than a false negative on a writing platform.
+
+### Short-text guard (all three signals)
+
+All three signals return **0.5 (neutral)** when the input is below their minimum data threshold:
+
+| Signal | Guard condition |
+|---|---|
+| Signal 1 (LLM) | fewer than 10 words — LLM judgment is unreliable with no context |
+| Signal 2 (stylometrics) | sub-metric guards: < 3 sentences for variance, < 20 tokens for TTR |
+| Signal 3 (phrase density) | fewer than 10 words |
+
+This means very short inputs (a single phrase, a title, two words) consistently produce `uncertain` rather than a confident misclassification. Without these guards, the LLM in particular would assign high AI scores to inputs like "sub dude" — two words with no linguistic signal — simply because there is nothing human-like to detect.
 
 ### Validated examples
 
@@ -112,21 +169,21 @@ The uncertain band (0.30–0.70) is intentionally wide. A false positive — lab
 
 > *"Artificial intelligence represents a transformative paradigm shift in modern society. It is important to note that while the benefits of AI are numerous, it is equally essential to consider the ethical implications. Furthermore, stakeholders across various sectors must collaborate to ensure responsible deployment."*
 
-| Signal 1 | Signal 2 | raw_score | attribution | confidence |
-|---|---|---|---|---|
-| 0.850 | 0.554 | 0.732 | `likely_ai` | **0.7316 (73%)** |
+| Signal 1 | Signal 2 | Signal 3 | raw_score | attribution | confidence |
+|---|---|---|---|---|---|
+| 0.850 | 0.554 | 1.000 | 0.791 | `likely_ai` | **0.7912 (79%)** |
 
-Both signals agree strongly. Signal 1 detects the hedging language and uniform formal tone. Signal 2 detects low sentence-length variance (all three sentences are similar length).
+All three signals agree. Signal 1 detects uniform formal tone. Signal 2 detects low sentence-length variance. Signal 3 scores 1.0 — the text contains "paradigm shift", "it is important to note", "furthermore", and "stakeholders", saturating the phrase density cap.
 
-**Lower-confidence case — borderline text (lightly edited AI output):**
+**Lower-confidence case — borderline text:**
 
 > *"I've been thinking a lot about remote work lately. There are genuine tradeoffs — flexibility and no commute on one side, isolation and blurred work-life boundaries on the other. Studies show productivity varies widely by individual and role type."*
 
-| Signal 1 | Signal 2 | raw_score | attribution | confidence |
-|---|---|---|---|---|
-| 0.300 | 0.536 | 0.395 | `uncertain` | **0.6108 (61%)** |
+| Signal 1 | Signal 2 | Signal 3 | raw_score | attribution | confidence |
+|---|---|---|---|---|---|
+| 0.420 | 0.536 | 0.000 | 0.371 | `uncertain` | **0.6290 (63%)** |
 
-Signal 1 reads the personal opener ("I've been thinking") as human-leaning. Signal 2 sees moderately uniform structure and pulls AI-ward. The signals partially conflict — the system correctly reports uncertainty rather than committing to a verdict.
+Signal 1 reads the personal opener as human-leaning. Signal 2 sees moderately uniform structure. Signal 3 scores 0.0 — no AI phrases present. Signals partially conflict — correctly reports uncertainty.
 
 ---
 
@@ -272,7 +329,101 @@ This risk is asymmetric by content type: a casual blog post is almost never misc
 
 ### 2. Short texts (fewer than 3–5 sentences)
 
-Signal 2 becomes unreliable for very short texts. You cannot compute meaningful sentence-length variance from two data points. The function returns a neutral 0.5 for that sub-metric when fewer than 3 sentences are detected, which means the system is effectively running on Signal 1 alone for haiku, single-paragraph excerpts, or short social media posts. The multi-signal guarantee does not hold for these inputs, and confidence scores may be misleadingly high because Signal 1 can be quite confident even when the structural evidence is absent.
+Signal 2 becomes unreliable for very short texts — you cannot compute meaningful sentence-length variance from two data points. Signal 1 has the same problem: given only a few words, the LLM has no linguistic signal to work with and produces arbitrary scores. Without guards, both signals would confidently misclassify short inputs.
+
+All three signals now return neutral 0.5 below their minimum data thresholds (see Confidence Scoring → Short-text guard above). For very short inputs this means the combined score sits near 0.5 → `uncertain`, which is the honest answer. The multi-signal guarantee still does not fully hold for short texts — all signals are returning guard values rather than real measurements — but the system no longer produces false high-confidence verdicts on degenerate inputs.
+
+### 3. Image classification is single-signal
+
+`POST /submit/image` runs Signal 1 (Groq vision) only. Stylometrics and phrase density have no image equivalent. Image AI-detection is inherently less reliable than text detection, and the label and appeal path work the same way — but treat image verdicts with more caution than text verdicts.
+
+---
+
+## Analytics
+
+`GET /analytics` returns aggregate metrics across all submissions:
+
+```json
+{
+  "total_submissions": 22,
+  "attribution_distribution": {"likely_ai": 14, "likely_human": 4, "uncertain": 4},
+  "appeal_rate": 0.0455,
+  "signal_agreement_rate": 0.4545
+}
+```
+
+**Signal agreement rate** measures the fraction of dual-signal submissions where Signal 1 and Signal 2 vote in the same direction. Rows where `signal_2_score == 0.5` are excluded — that is the neutral guard value, not a real vote. This metric demonstrates the value of multi-signal design: when both signals agree, the combined verdict is reliable; when they disagree, `uncertain` is the correct call.
+
+---
+
+## Provenance Certificate
+
+Creators can earn a "Verified Human" credential after a positive classification or a successful appeal.
+
+**Issue a certificate:**
+```bash
+curl -s -X POST http://localhost:5000/verify \
+  -H "Content-Type: application/json" \
+  -d '{"content_id": "<id>", "verification_statement": "I wrote this myself."}'
+```
+
+Response:
+```json
+{
+  "cert_id": "56a7fae8-7b57-4b86-909a-a802338fce01",
+  "content_id": "<id>",
+  "issued_at": "2026-06-29T09:04:44.950525+00:00",
+  "message": "Verified Human credential issued."
+}
+```
+
+**Retrieve a certificate:**
+```bash
+curl http://localhost:5000/certificate/56a7fae8-7b57-4b86-909a-a802338fce01
+```
+
+**Gate logic:**
+- `likely_human` → certificate issued immediately
+- `likely_ai` with no appeal → **403**: must file an appeal first
+- `likely_ai` with status `under_review` → certificate issued (appeal IS the authorship assertion)
+- Already certified → returns the existing certificate (idempotent — same `cert_id` every time)
+
+The appeal-first gate for `likely_ai` submissions is consistent with the false-positive philosophy: it does not make certification harder for a wrongly-flagged creator — it requires them to formally assert their authorship via the appeal, which creates the documentation record. Certification then seals that record with a credential.
+
+---
+
+## Multi-modal Support
+
+`POST /submit/image` accepts a base64-encoded image and assesses whether it appears AI-generated using the Groq vision model (`meta-llama/llama-4-scout-17b-16e-instruct`).
+
+```bash
+curl -s -X POST http://localhost:5000/submit/image \
+  -H "Content-Type: application/json" \
+  -d '{"image_b64": "<base64>", "media_type": "image/jpeg", "creator_id": "creator1"}'
+```
+
+Only Signal 1 applies — stylometrics and phrase density have no image equivalent. The response includes a `note` field documenting this limitation. The label, appeal path, and certificate path work identically to text submissions.
+
+---
+
+## Gradio UI
+
+```bash
+python ui.py
+```
+
+Launches on `http://localhost:7860`. Six tabs:
+
+| Tab | What it does |
+|---|---|
+| Analyze Text | Text + creator_id → label + full signal breakdown |
+| Analyze Image | Image upload + creator_id → image classification result |
+| File Appeal | content_id + reasoning → appeal confirmation |
+| Verify Human | content_id + statement → certificate or rejection reason |
+| Analytics | Refresh button → totals, distribution, appeal rate, signal agreement |
+| View Log | Limit selector → DataFrame of recent audit entries |
+
+`ui.py` calls `pipeline.process_text_submission()` directly — the same function Flask uses. No duplicated pipeline logic, no HTTP round-trip. Both Flask (`:5000`) and Gradio (`:7860`) share `provenance.db` with `sqlite3.connect(timeout=5)` to prevent lock contention.
 
 ---
 

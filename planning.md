@@ -337,3 +337,102 @@ flowchart TD
 - [x] Confidence scoring produces different labels at different score ranges — no binary flip at 0.5
 - [x] `## Architecture` section present with both flow diagrams from Milestone 1
 - [x] `## AI Tool Plan` covers M3/M4/M5 with specific sections, requests, and verification steps
+
+---
+
+## Stretch Feature 1 — Ensemble Detection (Signal 3: AI Phrase Density)
+
+### What it adds
+A third signal that is **lexically independent** from both Signal 1 (semantic/holistic) and Signal 2 (structural statistics). Signal 3 scans the text for a curated list of phrases disproportionately common in LLM output and computes their frequency per 1000 words.
+
+### Short-text guard added to Signal 1
+`get_llm_score()` now returns `0.5` (neutral) when the input is fewer than 10 words, consistent with the Signal 2 and Signal 3 guards. Without this guard, the LLM produced high-confidence AI scores on degenerate inputs (e.g. "sub dude" → 0.95) because there was no linguistic signal to evaluate — it was effectively hallucinating a verdict. All three signals now agree on neutral for very short text, producing `uncertain` rather than a false `likely_ai`.
+
+### Signal independence fix
+Signal 1's original system prompt enumerated specific AI phrases ("it is important to note", "furthermore", etc.), which overlapped directly with Signal 3's phrase list. This breaks signal independence — the whole point of an ensemble. **Fix:** remove the phrase enumeration from Signal 1's system prompt so Signal 1 judges holistically (voice, coherence, structure) and Signal 3 exclusively owns lexical pattern-matching. Both signals become more independently valuable.
+
+### Signal 3 design
+```
+Phrase list: "it is important to note", "furthermore", "moreover", "in conclusion",
+             "in summary", "it is crucial", "it is worth noting", "stakeholders",
+             "delve into", "leverage", "in today's", "in order to", "a comprehensive",
+             "a robust", "various sectors", "ensure responsible", "paradigm shift",
+             "navigate the", "collaborate to", "landscape of"
+
+density     = (phrase_match_count / word_count) × 1000   [phrases per 1000 words]
+MAX_DENSITY = 5.0
+score       = min(density, MAX_DENSITY) / MAX_DENSITY
+Guard: word_count < 10 → return 0.5 (neutral)
+```
+
+**Reliability note:** Phrase density is the weakest of the three signals — it is gameable (an author or an AI can simply omit these phrases), and its phrase list is static (new AI writing patterns may not appear on it). It is included as a complementary third signal; Signal 1 remains the dominant contributor.
+
+### Updated combination formula
+```
+raw_score = 0.50 × signal_1_score + 0.30 × signal_2_score + 0.20 × signal_3_score
+```
+
+### DB changes
+- `signal_3_score REAL` column added to `submissions` via ALTER TABLE (nullable; NULL for pre-Ensemble entries and image submissions)
+
+---
+
+## Stretch Feature 2 — Analytics Dashboard (GET /analytics)
+
+### Metrics
+- **Attribution distribution** — COUNT grouped by `attribution` (likely_ai / likely_human / uncertain)
+- **Appeal rate** — fraction of submissions where `appeal_timestamp IS NOT NULL`
+- **Signal agreement rate** (own metric) — fraction of dual-scored submissions where Signal 1 and Signal 2 vote in the same direction, demonstrating the value of multi-signal design
+
+### Signal agreement definition and known limitation
+Agreement is defined as: both `signal_1_score > 0.5` OR both `< 0.5`, excluding rows where `signal_2_score` is exactly `0.5` (the neutral guard value returned for short texts / too-few-token inputs). Filtering `signal_2_score != 0.5` prevents neutral guard returns from being miscounted as AI-direction votes. **Limitation:** if a non-guard submission legitimately scores exactly 0.5 on Signal 2 it is also excluded — this is an acceptable edge case given the rarity of exact 0.5 averages from real sub-metric computation.
+
+---
+
+## Stretch Feature 3 — Provenance Certificate
+
+### Design
+A creator earns a "Verified Human" credential when their submission is classified `likely_human` **OR** its status is `under_review` (they have already appealed a misclassification). A `likely_ai` submission with no appeal cannot be certified — the creator must appeal first.
+
+**Why the appeal-first gate is consistent with the false-positive philosophy:** The gate does not make it harder for a wrongly-flagged human to get certified — it requires them to formally assert their authorship via the appeal first. The appeal IS the human-authorship assertion that creates the documentation record for certification. Certification then seals that record with a credential. This two-step sequence (assert → certify) is more defensible than issuing credentials to anyone who clicks a button, because the appeal forces a written statement that a reviewer can read. Caring about false positives means giving the falsely-flagged creator a *meaningful* path, not a frictionless one.
+
+### Idempotency
+`POST /verify` on an already-certified `content_id` returns the **existing** certificate (same `cert_id`), does not mint a second one.
+
+### DB changes
+- New `certificates` table: `cert_id TEXT PK`, `content_id TEXT`, `creator_id TEXT`, `issued_at TEXT`, `statement TEXT`
+- `certificate_id TEXT` column added to `submissions` (nullable; populated when a cert is issued)
+
+---
+
+## Stretch Feature 4 — Multi-modal Support (Image via Groq Vision)
+
+### What it adds
+A `POST /submit/image` endpoint that accepts a base64-encoded image and assesses whether it appears AI-generated, using a Groq vision model. The same `classify()`, `generate_label()`, and appeal path are reused.
+
+### Single-signal limitation — considered tradeoff
+For images, Signal 2 (stylometrics) and Signal 3 (phrase density) have no structural equivalent — there is no "sentence-length variance" for a pixel grid. Only the LLM vision signal applies. This is documented honestly as a considered limitation: the image path is explicitly single-signal, and `classify()` is called directly on `signal_1_score` (same as the text parse-failure path). To account for reduced certainty from a single signal, the `uncertain` band is widened for images by shifting the thresholds: `>= 0.75` → likely_ai, `<= 0.25` → likely_human (vs 0.70/0.30 for text). This makes the image path appropriately more conservative.
+
+### Model verification requirement
+Exact Groq vision model ID must be verified against the Groq console before implementation. Do not use a model string from memory. If no free-tier vision model is available, stop and document this rather than failing at runtime.
+
+### DB changes
+- `content_type TEXT DEFAULT 'text'` column added to `submissions`
+
+---
+
+## Stretch Feature 5 — Gradio UI (`ui.py`)
+
+### Shared pipeline (fix #8)
+The core text-submission logic is extracted to `pipeline.py` → `process_text_submission(text, creator_id) -> dict`. Both the Flask `/submit` route and the Gradio text tab call this function. No duplicated pipeline logic anywhere.
+
+### SQLite concurrency fix
+All `sqlite3.connect()` calls use `timeout=5` to prevent "database is locked" errors when Flask (:5000) and Gradio (:7860) write to `provenance.db` concurrently.
+
+### Tab structure
+1. Analyze Text — text + creator_id → full result
+2. Analyze Image — image upload + creator_id → image result  
+3. File Appeal — content_id + reasoning → confirmation
+4. Verify Human — content_id + statement → certificate or rejection
+5. Analytics — refresh button → distribution chart + metrics
+6. View Log — limit selector → DataFrame of recent entries
