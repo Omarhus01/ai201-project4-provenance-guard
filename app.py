@@ -9,7 +9,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
 from audit import get_log, init_db, write_submission
-from signals import classify, get_llm_score
+from signals import classify, combine_scores, get_llm_score, get_stylometric_score
 
 app = Flask(__name__)
 
@@ -38,6 +38,9 @@ def submit():
 
     content_id = str(uuid.uuid4())
 
+    # Signal 2 first — pure Python, always succeeds, always available to log
+    signal_2_score = get_stylometric_score(text)
+
     try:
         signal_1_score = get_llm_score(text)
     except Exception as e:
@@ -46,12 +49,16 @@ def submit():
 
     notes = None
     if signal_1_score is None:
+        # Signal 1 parse failure: classifying on signal_2 alone would violate the
+        # multi-signal principle (signal_1 carries 60% weight), so default to uncertain.
+        # signal_2_score is still logged as valid data.
         app.logger.warning(f"[{content_id}] Signal 1 parse failure — defaulting to uncertain")
         notes = "signal_1_parse_error"
         attribution = "uncertain"
         confidence = 0.5
     else:
-        attribution, confidence = classify(signal_1_score)
+        raw_score = combine_scores(signal_1_score, signal_2_score)
+        attribution, confidence = classify(raw_score)
 
     label = f"[MS3 placeholder] Attribution: {attribution}"
 
@@ -61,7 +68,7 @@ def submit():
         attribution=attribution,
         confidence=confidence,
         signal_1_score=signal_1_score,
-        signal_2_score=None,
+        signal_2_score=signal_2_score,
         label=label,
         notes=notes,
     )

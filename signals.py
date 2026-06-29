@@ -1,5 +1,7 @@
 import json
 import os
+import re
+import string
 
 from groq import Groq
 
@@ -65,6 +67,54 @@ def classify(raw_score: float) -> tuple[str, float]:
     return attribution, confidence
 
 
+def get_stylometric_score(text: str) -> float:
+    """Return structural AI-likeness score 0.0–1.0. Pure Python, never raises.
+
+    Three sub-metrics averaged; 1.0 = maximally AI-like, 0.0 = maximally human-like.
+    Sentence-length variance is the dominant signal; TTR is the weakest (see inline note).
+    """
+    # Sub-metric 1: Sentence-length variance
+    # Low variance = AI-like (uniform sentence lengths) → high sub_score
+    sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
+    if len(sentences) < 3:
+        sent_var_score = 0.5  # neutral — too few sentences for reliable variance
+    else:
+        lengths = [len(s.split()) for s in sentences]
+        mean = sum(lengths) / len(lengths)
+        variance = sum((l - mean) ** 2 for l in lengths) / len(lengths)
+        MAX_VAR = 100.0
+        sent_var_score = 1.0 - min(variance, MAX_VAR) / MAX_VAR
+
+    # Sub-metric 2: Type-token ratio (TTR)
+    # High TTR = diverse vocabulary = human-like → low sub_score.
+    # TTR is the weakest sub-metric: for texts under ~80 words, TTR saturates toward 1.0
+    # regardless of authorship, so it can mildly mis-vote on short AI text (scoring it
+    # slightly human-like). Retained per spec; sentence-length variance carries most signal.
+    tokens = re.findall(r'\b\w+\b', text.lower())
+    if len(tokens) < 20:
+        ttr_score = 0.5  # neutral — too few tokens for reliable TTR
+    else:
+        ttr = len(set(tokens)) / len(tokens)
+        ttr_score = 1.0 - ttr
+
+    # Sub-metric 3: Punctuation density
+    # Low density = AI-like (standard minimal punctuation) → high sub_score
+    if not text:
+        punct_score = 0.5
+    else:
+        punct_count = sum(1 for c in text if c in string.punctuation)
+        density = punct_count / len(text)
+        MAX_DENSITY = 0.10
+        punct_score = 1.0 - min(density, MAX_DENSITY) / MAX_DENSITY
+
+    return round((sent_var_score + ttr_score + punct_score) / 3.0, 4)
+
+
+def combine_scores(s1: float, s2: float) -> float:
+    """Weighted combination: LLM 60%, stylometrics 40%, per planning.md spec."""
+    return round(0.60 * s1 + 0.40 * s2, 4)
+
+
 if __name__ == "__main__":
     from dotenv import load_dotenv
 
@@ -91,6 +141,15 @@ if __name__ == "__main__":
             ),
         ),
         (
+            "Formal human",
+            (
+                "The relationship between monetary policy and asset price inflation has been "
+                "extensively studied in the literature. Central banks face a fundamental tension "
+                "between their mandate for price stability and the unintended consequences of "
+                "prolonged low interest rates on equity and real estate valuations."
+            ),
+        ),
+        (
             "Borderline",
             (
                 "I've been thinking a lot about remote work lately. There are genuine tradeoffs "
@@ -101,10 +160,14 @@ if __name__ == "__main__":
         ),
     ]
 
+    print(f"{'Sample':<16} {'s1':>6} {'s2':>6} {'raw':>6} {'attribution':<14} {'confidence':>10}")
+    print("-" * 66)
     for label, text in tests:
-        score = get_llm_score(text)
-        if score is not None:
-            attribution, confidence = classify(score)
-            print(f"{label:15s} score={score:.3f}  attribution={attribution:12s}  confidence={confidence:.4f}")
+        s2 = get_stylometric_score(text)
+        s1 = get_llm_score(text)
+        if s1 is not None:
+            raw = combine_scores(s1, s2)
+            attribution, confidence = classify(raw)
+            print(f"{label:<16} {s1:>6.3f} {s2:>6.3f} {raw:>6.3f} {attribution:<14} {confidence:>10.4f}")
         else:
-            print(f"{label:15s} PARSE FAILURE")
+            print(f"{label:<16} {'PARSE FAILURE':>40}")

@@ -164,6 +164,7 @@ flowchart TD
   - **Type-token ratio:** Low diversity = AI-like (high uniformity). `sub_score = 1 − type_token_ratio` (high TTR = diverse = human)
   - **Punctuation density:** Low density = AI-like (clean, minimal punctuation; human writing tends toward stylistic punctuation — em dashes, ellipses, informal omissions). `sub_score = 1 − normalized_punctuation_density`
 - `signal_2_score = mean(sentence_variance_score, ttr_score, punctuation_score)`
+- **Sub-metric reliability note:** Sentence-length variance is the dominant sub-metric. TTR is the weakest: for texts under ~80 words, TTR saturates toward 1.0 regardless of authorship (most words are unique in a short passage), meaning it can mildly mis-vote on short AI text (scoring it slightly human-like). TTR is retained per spec but contributes limited differentiation on typical short submissions; sentence-length variance carries most of the signal.
 
 **Combination formula:**
 ```
