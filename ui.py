@@ -55,13 +55,28 @@ def run_analyze_text(text: str, creator_id: str):
 # Tab 2 — Analyze Image
 # ---------------------------------------------------------------------------
 
+def _detect_media_type(image_bytes: bytes, path: str) -> str:
+    """Detect image media type from magic bytes, falling back to extension."""
+    if image_bytes[:8] == b'\x89PNG\r\n\x1a\n':
+        return "image/png"
+    if image_bytes[:3] == b'\xff\xd8\xff':
+        return "image/jpeg"
+    if image_bytes[:6] in (b'GIF87a', b'GIF89a'):
+        return "image/gif"
+    if image_bytes[:4] == b'RIFF' and image_bytes[8:12] == b'WEBP':
+        return "image/webp"
+    if image_bytes[:2] == b'BM':
+        return "image/bmp"
+    ext = os.path.splitext(path)[1].lower().lstrip('.')
+    return f"image/{ext}" if ext else "image/jpeg"
+
+
 def run_analyze_image(image_path: str, creator_id: str):
     if not image_path:
         return "Error: please upload an image.", {}
     if not creator_id or not creator_id.strip():
         return "Error: creator_id is required.", {}
 
-    import imghdr
     import uuid
 
     from audit import write_submission
@@ -70,8 +85,7 @@ def run_analyze_image(image_path: str, creator_id: str):
         image_bytes = f.read()
 
     image_b64 = base64.b64encode(image_bytes).decode()
-    detected = imghdr.what(image_path)
-    media_type = f"image/{detected}" if detected else "image/jpeg"
+    media_type = _detect_media_type(image_bytes, image_path)
 
     content_id = str(uuid.uuid4())
     try:

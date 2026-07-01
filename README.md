@@ -2,6 +2,8 @@
 
 A backend system for AI-content attribution on creative writing platforms. Submit a piece of text and get back a structured classification, confidence score, and transparency label. Creators who disagree with a verdict can file an appeal.
 
+**Portfolio walkthrough video:** https://www.loom.com/share/c0c0a4c69f774413a4a70600a714e456
+
 ---
 
 ## Quickstart
